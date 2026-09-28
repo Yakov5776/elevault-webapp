@@ -1,6 +1,6 @@
 {
   "name": "elevault-web",
-  "version": "1.0.0",
+  "version": "2.5.33",
   "private": true,
   "description": "Browser client for Elevault backed by the existing Elevault services",
   "main": "server.js",

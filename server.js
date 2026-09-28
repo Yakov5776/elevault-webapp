@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { version } = require('./package.json');
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -286,6 +287,7 @@ function vaultKeySummary(key) {
     name: key.name || '',
     active: key.active === true || key.active === 1 || key.active === 'true',
     legacyNumber: key.legacyNumber == null ? '' : String(key.legacyNumber),
+    routingNumber: key.routingNumber ?? key.bankRoutingTransitNumber ?? key.routingTransitNumber ?? '',
     slotGuid: key.slotGuid || '',
     slotName: key.slotName || ''
   };
@@ -305,7 +307,7 @@ function notificationSummaries(value) {
 }
 
 app.get('/api/health', (req, res) => {
-  res.json({ configured: Boolean(apiKey), authenticated: Boolean(req.session.tokens?.accessToken) });
+  res.json({ configured: Boolean(apiKey), authenticated: Boolean(req.session.tokens?.accessToken), version });
 });
 
 app.post('/api/auth/request-code', ensureSameOrigin, async (req, res, next) => {

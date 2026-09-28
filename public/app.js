@@ -3,14 +3,27 @@ const modal = document.querySelector('#modal');
 const toast = document.querySelector('#toast');
 const dashboardWidgetCatalog = [
   ['balance', 'Available balance'],
-  ['vaults', 'Vault accounts'],
-  ['activity', 'Recent activity'],
-  ['accounts', 'Linked accounts'],
+  ['vaults', 'Vaults'],
+  ['activity', 'Activity'],
+  ['accounts', 'Accounts'],
   ['goals', 'Savings goals'],
   ['rate', 'Deposit rate'],
   ['shortcuts', 'Quick actions']
 ];
 const defaultDashboardWidgets = dashboardWidgetCatalog.map(([id]) => id);
+
+function readThemePreference() {
+  try { return localStorage.getItem('elevault.theme') === 'dark' ? 'dark' : 'light'; }
+  catch { return 'light'; }
+}
+
+function applyTheme(theme) {
+  const selectedTheme = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = selectedTheme;
+  try { localStorage.setItem('elevault.theme', selectedTheme); } catch {}
+}
+
+applyTheme(readThemePreference());
 
 function readDashboardWidgets() {
   try {
@@ -28,6 +41,7 @@ modal.addEventListener('click', event => {
 const state = {
   configured: false,
   authenticated: false,
+  siteVersion: '',
   page: 'dashboard',
   customer: null,
   vaults: [],
@@ -46,6 +60,8 @@ const state = {
   moreTab: 'settings',
   moreData: {},
   moreLoading: false,
+  moreLoaded: false,
+  moreLoadPromise: null,
   loading: false
 };
 
@@ -123,10 +139,10 @@ function formatMoney(value) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(number);
 }
 
-function formatRate(response) {
+function formatRate(response, field = 'rateValue') {
   const source = unwrap(response);
   const records = Array.isArray(source) ? source : listFrom(source);
-  const rate = valueFrom(source, ['rateValue']) ?? valueFrom(records[0], ['rateValue']);
+  const rate = valueFrom(source, [field]) ?? valueFrom(records[0], [field]);
   const number = Number(rate);
   return Number.isFinite(number) ? `${(number * 100).toFixed(2)}%` : '—';
 }
@@ -197,6 +213,15 @@ function dateLabel(value) {
   return Number.isNaN(date.getTime()) ? safe(value) : new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
 }
 
+function shortDateLabel(value) {
+  if (!value) return 'Date unavailable';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return safe(value);
+  const options = { month: 'short', day: 'numeric' };
+  if (date.getFullYear() !== new Date().getFullYear()) options.year = 'numeric';
+  return new Intl.DateTimeFormat('en-US', options).format(date);
+}
+
 function transactionTitle(item) {
   return valueFrom(item, ['longSmartLabel', 'shortSmartLabel', 'description', 'merchantName', 'transactionDescription', 'name', 'type']) || 'Transaction';
 }
@@ -258,6 +283,7 @@ function renderLogin(step = 'credentials', error = '') {
         await api('/api/auth/verify-code', { method: 'POST', body: { code: formData.get('code') } });
         state.authenticated = true;
         await loadDashboard();
+        loadMoreData();
         await applyLocationRoute();
       }
     } catch (requestError) {
@@ -270,9 +296,9 @@ function renderLogin(step = 'credentials', error = '') {
 
 const navItems = [
   ['dashboard', 'Overview', 'grid'],
-  ['vaults', 'My vaults', 'vault'],
+  ['vaults', 'Vaults', 'vault'],
   ['activity', 'Activity', 'swap'],
-  ['accounts', 'Linked accounts', 'link'],
+  ['accounts', 'Accounts', 'link'],
   ['notifications', 'Notifications', 'bell'],
   ['more', 'More', 'settings']
 ];
@@ -281,26 +307,31 @@ function renderShell(content, { animate = true } = {}) {
   const name = displayName();
   const profileImage = profilePhotoUrl();
   const navPage = state.page === 'vaultDetail' ? 'vaults' : state.page;
+  const selectedVault = state.page === 'vaultDetail' ? state.vaults.find(vault => vaultId(vault) === state.selectedVaultId) : null;
+  const breadcrumb = selectedVault
+    ? `My vaults <span aria-hidden="true">/</span> <strong>${safe(vaultName(selectedVault))}</strong>`
+    : state.page === 'dashboard' ? 'Overview'
+      : `Your financial home <span aria-hidden="true">/</span> ${safe(navItems.find(item => item[0] === navPage)?.[1] || 'Overview')}`;
   const unread = state.notifications.filter(item => !valueFrom(item, ['read', 'isRead', 'readAt'])).length;
+  const renderNavItems = items => items.map(([key, label, glyph]) => `
+          <button class="nav-item ${navPage === key ? 'active' : ''}" data-page="${key}" type="button">${glyph ? icon(glyph) : ''}<span>${label}</span>${key === 'notifications' && unread ? `<span class="nav-count">${unread}</span>` : ''}</button>`).join('');
   appRoot.innerHTML = `
     <div class="shell">
       <aside class="sidebar" id="sidebar">
         <a class="brand" href="/dashboard" aria-label="Elevault home"><img class="brand-symbol" src="/assets/elevault-mark.png" alt=""><span class="brand-name">elevault</span></a>
         <p class="brand-caption">Your financial home</p>
-        <p class="nav-label">Workspace</p>
-        <nav class="nav-list" aria-label="Main navigation">${navItems.map(([key, label, glyph]) => `
-          <button class="nav-item ${navPage === key ? 'active' : ''}" data-page="${key}" type="button">${icon(glyph)}<span>${label}</span>${key === 'notifications' && unread ? `<span class="nav-count">${unread}</span>` : ''}</button>`).join('')}</nav>
+        <nav class="nav-list" aria-label="Main navigation"><div class="nav-group">${renderNavItems(navItems.slice(0, 4))}</div><div class="nav-divider"></div><div class="nav-group">${renderNavItems(navItems.slice(4))}</div></nav>
         <div class="sidebar-bottom">
-          <div class="security-note"><strong>Your account, protected</strong><p>Your sign-in stays between this browser and Elevault’s secure services.</p></div>
           <div class="sidebar-user"><span class="avatar">${safe(initials(name))}${profileImage ? `<img class="avatar-image" src="${safe(profileImage)}" alt="" referrerpolicy="no-referrer">` : ''}</span><span class="user-copy"><strong>${safe(name)}</strong><span>${safe(unwrap(state.customer)?.email || 'Elevault member')}</span></span><button class="icon-button" id="logout" type="button" aria-label="Sign out" title="Sign out">${icon('logout')}</button></div>
         </div>
       </aside>
       <section class="main-column">
-        <header class="topbar"><button class="icon-button mobile-menu" id="menu-toggle" type="button" aria-label="Open navigation">${icon('menu')}</button><div class="mobile-brand"><img class="brand-symbol" src="/assets/elevault-mark.png" alt="">elevault</div><div class="crumb">Your financial home <span aria-hidden="true">/</span> ${safe(navItems.find(item => item[0] === navPage)?.[1] || 'Overview')}</div></header>
+        <header class="topbar"><button class="icon-button mobile-menu" id="menu-toggle" type="button" aria-label="Open navigation">${icon('menu')}</button><div class="mobile-brand"><img class="brand-symbol" src="/assets/elevault-mark.png" alt="">elevault</div><div class="crumb">${breadcrumb}</div><span class="site-version">Version ${safe(state.siteVersion)}</span></header>
         <div class="content${animate ? ' page-enter' : ''}">${content}</div>
       </section>
     </div>`;
   setMoneyPlaceholders(appRoot);
+  bindTransactionMetadata(appRoot);
   appRoot.querySelectorAll('.nav-item[data-page]').forEach(button => button.addEventListener('click', () => {
     if (state.page === button.dataset.page) {
       document.querySelector('#sidebar')?.classList.remove('open');
@@ -314,15 +345,18 @@ function renderShell(content, { animate = true } = {}) {
     const vault = state.vaults.find(item => vaultId(item) === link.dataset.vaultLink);
     if (vault) openVaultDetail(vault);
   }));
-  appRoot.querySelectorAll('[data-transaction-metadata]').forEach(button => button.addEventListener('click', async () => {
+  document.querySelector('#logout').addEventListener('click', logout);
+  document.querySelector('#menu-toggle').addEventListener('click', () => document.querySelector('#sidebar').classList.toggle('open'));
+  appRoot.querySelectorAll('.avatar-image').forEach(image => image.addEventListener('error', () => image.remove(), { once: true }));
+}
+
+function bindTransactionMetadata(root) {
+  root.querySelectorAll('[data-transaction-metadata]').forEach(button => button.addEventListener('click', async () => {
     try {
       const metadata = await api(`/api/data/transactions/${encodeURIComponent(button.dataset.transactionMetadata)}/metadata`);
       openModal('Transaction details', 'Details provided by Elevault.', `<pre class="metadata-view">${safe(JSON.stringify(unwrap(metadata), null, 2))}</pre>`, 'Close', async () => ({}));
     } catch (error) { showToast(error.message, true); }
   }));
-  document.querySelector('#logout').addEventListener('click', logout);
-  document.querySelector('#menu-toggle').addEventListener('click', () => document.querySelector('#sidebar').classList.toggle('open'));
-  appRoot.querySelectorAll('.avatar-image').forEach(image => image.addEventListener('error', () => image.remove(), { once: true }));
 }
 
 function pageHeading(eyebrow, title, subtitle, action = '') {
@@ -335,9 +369,18 @@ function vaultAccountRows(vaults) {
     if (!id) return '';
     const isEmergency = String(vault.slotTypeGuid || '').toUpperCase() === slotTypeGuids.emergency;
     const slotType = state.slotTypes.find(item => String(item.slotTypeGuid || '').toUpperCase() === String(vault.slotTypeGuid || '').toUpperCase());
-    const emergencyImage = isEmergency && slotType?.imageUrl ? `<img class="vault-type-image" src="${safe(slotType.imageUrl)}" alt="">` : icon('umbrella');
     const goalSetup = emergencySetupNeeded(vault);
-    const rowContent = `<span class="bank-list-account"><span class="bank-list-icon${isEmergency ? ' bank-list-icon-emergency' : ''}">${isEmergency ? emergencyImage : icon('vault')}</span><span><strong>${safe(vaultName(vault))}</strong><small>${safe(vaultType(vault))}${goalSetup ? ' · Savings goal setup needed' : ''}</small></span></span>${goalSetup ? '' : `<span class="bank-list-balance"><small>Available balance</small><strong>${formatMoney(vaultAmount(vault))}</strong></span>`}${icon('arrow')}`;
+    const name = vaultName(vault);
+    const type = vaultType(vault);
+    const goalAmount = Number(vault.slotGoal?.amount) || 0;
+    const detail = goalSetup ? 'Savings goal setup needed'
+      : isEmergency ? `Savings goal · ${goalAmount > 0 ? formatMoney(goalAmount) : 'Not yet funded'}`
+        : goalAmount > 0 ? `Savings goal · ${formatMoney(goalAmount)}`
+        : name.toLowerCase() === type.toLowerCase() ? '' : type;
+    const vaultIcon = isEmergency && slotType?.imageUrl
+      ? `<img class="vault-type-image" src="${safe(slotType.imageUrl)}" alt="">`
+      : icon(isEmergency ? 'umbrella' : 'vault');
+    const rowContent = `<span class="bank-list-account"><span class="bank-list-icon${isEmergency ? ' bank-list-icon-emergency' : ''}">${vaultIcon}</span><span class="bank-list-copy"><strong>${safe(name)}</strong>${detail ? `<small>${safe(detail)}</small>` : ''}</span></span>${goalSetup ? '' : `<span class="bank-list-balance"><strong>${formatMoney(vaultAmount(vault))}</strong></span>`}${icon('arrow')}`;
     const row = goalSetup
       ? `<button class="vault-account-row emergency-setup-row" data-emergency-setup="${safe(id)}" type="button">${rowContent}</button>`
       : `<a class="vault-account-row" href="/vault/${encodeURIComponent(id)}" data-vault-link="${safe(id)}">${rowContent}</a>`;
@@ -364,12 +407,13 @@ function transactionHoldNotice(item) {
   const expireDate = new Date(memo.expireTimestamp);
   if (Number.isNaN(expireDate.getTime())) return '';
   const amount = Math.abs(Number(memo.amountDecimal) || 0);
-  return `<div class="activity-hold">Held until: ${dateLabel(expireDate)}${amount ? ` (${formatMoney(amount)})` : ''}</div>`;
+  return `<div class="activity-hold">${amount ? `<strong>${formatMoney(amount)} pending</strong> · ` : 'Pending · '}Available ${dateLabel(expireDate)}</div>`;
 }
 
-function transactionTable(items, limit = 5) {
+function transactionTable(items, limit = 5, { vaultScoped = false } = {}) {
   if (!items.length) return `<div class="empty-state"><strong>No activity to show</strong>Transactions from your Elevault accounts will appear here.</div>`;
-  return `<div class="table-wrap"><table class="activity-table"><thead><tr><th>Details</th><th>Date</th><th>Vault</th><th>Amount</th></tr></thead><tbody>${items.slice(0, limit).map(item => {
+  const columns = vaultScoped ? '<th>Details</th><th>Date</th><th>Amount</th>' : '<th>Details</th><th>Date</th><th>Vault</th><th>Amount</th>';
+  return `<div class="table-wrap${vaultScoped ? ' vault-activity-table' : ''}"><table class="activity-table"><thead><tr>${columns}</tr></thead><tbody>${items.slice(0, limit).map(item => {
     const amount = Number(transactionAmount(item));
     const relatedVault = state.vaults.find(vault => vaultId(vault) === valueFrom(item, ['slotGuid', 'vaultGuid']));
     const transactionGuid = valueFrom(item, ['transactionGuid', 'id']);
@@ -379,8 +423,79 @@ function transactionTable(items, limit = 5) {
     const title = transactionGuid
       ? `<button class="activity-title activity-detail-button" type="button" data-transaction-metadata="${safe(transactionGuid)}">${safe(transactionTitle(item))}</button>`
       : `<span class="activity-title">${safe(transactionTitle(item))}</span>`;
-    return `<tr><td><div class="activity-details">${iconMarkup}<div class="activity-copy">${title}<div class="activity-date">${safe(valueFrom(item, ['transactionType', 'type', 'status']) || '')}</div>${transactionHoldNotice(item)}</div></div></td><td>${dateLabel(valueFrom(item, ['transactionDateTime', 'date', 'createdAt', 'postedAt']))}</td><td>${safe(relatedVault ? vaultName(relatedVault) : valueFrom(item, ['slotName', 'vaultName']) || '—')}</td><td class="${amount > 0 ? 'amount-positive' : 'amount-negative'}">${amount > 0 ? '+' : ''}${formatMoney(amount)}</td></tr>`;
+    const transactionDate = valueFrom(item, ['transactionDateTime', 'date', 'createdAt', 'postedAt']);
+    const formattedDate = vaultScoped ? shortDateLabel(transactionDate) : dateLabel(transactionDate);
+    return `<tr><td><div class="activity-details">${iconMarkup}<div class="activity-copy">${title}<div class="activity-date">${safe(valueFrom(item, ['transactionType', 'type', 'status']) || '')}</div>${transactionHoldNotice(item)}</div></div></td><td>${formattedDate}</td>${vaultScoped ? '' : `<td>${safe(relatedVault ? vaultName(relatedVault) : valueFrom(item, ['slotName', 'vaultName']) || '—')}</td>`}<td class="${amount > 0 ? 'amount-positive' : 'amount-negative'}">${amount > 0 ? '+' : ''}${formatMoney(amount)}</td></tr>`;
   }).join('')}</tbody></table></div>`;
+}
+
+function activitySparkline(items) {
+  if (!items.length || activeVaults().length > 12) return '';
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Array.from({ length: 30 }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (29 - index));
+    const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+    return { date, key, amount: 0, count: 0 };
+  });
+  const byDate = new Map(days.map(day => [day.key, day]));
+  items.forEach(item => {
+    const date = new Date(valueFrom(item, ['transactionDateTime', 'date', 'createdAt', 'postedAt']));
+    if (Number.isNaN(date.getTime())) return;
+    const day = byDate.get(`${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`);
+    if (day) {
+      day.amount += Math.abs(Number(transactionAmount(item)) || 0);
+      day.count += 1;
+    }
+  });
+  const maximum = Math.max(...days.map(day => day.amount));
+  if (!maximum) return '';
+  const bars = days.map(day => {
+    const height = day.amount ? Math.max(5, day.amount / maximum * 100) : 2;
+    const countLabel = `${day.count} transaction${day.count === 1 ? '' : 's'}`;
+    const label = `${dateLabel(day.date)}: ${formatMoney(day.amount)}, ${countLabel}`;
+    return `<span class="activity-sparkline-bar${day.amount ? ' has-activity' : ''}" style="--bar-height:${height}%" role="img" tabindex="0" aria-label="${safe(label)}"><span class="activity-sparkline-tooltip" aria-hidden="true"><strong>${safe(dateLabel(day.date))}</strong><span>${formatMoney(day.amount)}</span><span>${countLabel}</span></span></span>`;
+  }).join('');
+  return `<div class="activity-sparkline" role="group" aria-label="Daily transaction activity over the past 30 days"><span>Transaction activity · Past 30 days</span><div>${bars}</div></div>`;
+}
+
+function dashboardActivityRows(items, limit = 5) {
+  if (!items.length) return `<div class="empty-state"><strong>No activity to show</strong>Transactions from your Elevault accounts will appear here.</div>`;
+  const dateValue = item => valueFrom(item, ['transactionDateTime', 'date', 'createdAt', 'postedAt']);
+  const recent = [...items].sort((first, second) => new Date(dateValue(second) || 0) - new Date(dateValue(first) || 0)).slice(0, limit);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const groups = new Map();
+  recent.forEach(item => {
+    const rawDate = dateValue(item);
+    const date = rawDate ? new Date(rawDate) : null;
+    const validDate = date && !Number.isNaN(date.getTime());
+    const day = validDate ? new Date(date) : null;
+    if (day) day.setHours(0, 0, 0, 0);
+    const label = !validDate ? 'Date unavailable'
+      : day.getTime() === today.getTime() ? 'Today'
+        : day.getTime() === yesterday.getTime() ? 'Yesterday' : shortDateLabel(date);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(item);
+  });
+  const rows = [...groups].map(([label, group]) => `<section class="overview-activity-group"><h3>${safe(label)}</h3>${group.map(item => {
+    const amount = Number(transactionAmount(item));
+    const transactionGuid = valueFrom(item, ['transactionGuid', 'id']);
+    const title = transactionGuid
+      ? `<button class="activity-title activity-detail-button" type="button" data-transaction-metadata="${safe(transactionGuid)}">${safe(transactionTitle(item))}</button>`
+      : `<span class="activity-title">${safe(transactionTitle(item))}</span>`;
+    const vault = state.vaults.find(candidate => vaultId(candidate) === valueFrom(item, ['slotGuid', 'vaultGuid']));
+    const details = [valueFrom(item, ['transactionType', 'type', 'status']), vault ? vaultName(vault) : valueFrom(item, ['slotName', 'vaultName'])].filter(Boolean).join(' · ');
+    const transactionType = transactionTypeFor(item);
+    const transactionIcon = transactionType?.imageUrl
+      ? `<span class="overview-transaction-icon"><img src="${safe(transactionType.imageUrl)}" alt="" loading="lazy"></span>`
+      : `<span class="overview-transaction-icon overview-transaction-icon-fallback">${icon('swap')}</span>`;
+    return `<div class="overview-activity-row"><div class="overview-activity-copy">${transactionIcon}<div class="overview-activity-description">${title}${details ? `<span>${safe(details)}</span>` : ''}${transactionHoldNotice(item)}</div></div><div class="overview-activity-amount"><strong class="${amount > 0 ? 'amount-positive' : 'amount-negative'}">${amount > 0 ? '+' : ''}${formatMoney(amount)}</strong><span>${shortDateLabel(dateValue(item))}</span></div></div>`;
+  }).join('')}</section>`).join('');
+  return `<div class="overview-activity-list">${rows}</div>`;
 }
 
 function linkedAccountRows(accounts) {
@@ -399,12 +514,14 @@ function renderDashboard({ preserveScroll = state.customizingWidgets } = {}) {
   const availableWidgets = dashboardWidgetCatalog.filter(([id]) => !widgetIds.includes(id));
   const widgetActions = state.customizingWidgets
     ? `<div class="heading-actions customize-actions"><button class="icon-button" id="cancel-widget-customization" type="button" aria-label="Discard widget changes" title="Discard changes">${icon('close')}</button><button class="icon-button save-widget-layout" id="save-widget-customization" type="button" aria-label="Save widget layout" title="Save layout">${icon('check')}</button></div>`
-    : `<div class="heading-actions"><button class="icon-button" id="manage-widgets" type="button" aria-label="Customize overview" title="Customize overview">${icon('settings')}</button><button class="button secondary" data-action="transfer" type="button">${icon('swap')} Transfer</button><button class="button" data-action="new-vault" type="button">${icon('plus')} New vault</button></div>`;
+    : `<div class="heading-actions"><button class="icon-button" id="manage-widgets" type="button" aria-label="Customize overview" title="Customize overview">${icon('settings')}</button></div>`;
   const hiddenWidgets = state.customizingWidgets
     ? `<section class="hidden-widgets"><div class="widget-heading"><div><h2>Add widgets</h2><p class="heading-sub">Choose a hidden widget to add it back.</p></div></div><div class="hidden-widget-list">${availableWidgets.map(([id, label]) => `<div class="hidden-widget-row"><span>${label}</span><button class="icon-button widget-add-button" type="button" data-widget-add="${id}" aria-label="Add ${label}" title="Add ${label}">${icon('plus')}</button></div>`).join('') || '<p class="all-widgets-visible">All widgets are currently visible.</p>'}</div></section>`
     : '';
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
   const content = `
-    ${pageHeading('Online banking', `Welcome, ${safe(displayName().split(' ')[0])}`, 'Your accounts at a glance.', widgetActions)}
+    ${pageHeading('', 'Overview', `${greeting}, ${safe(displayName().split(' ')[0])}.`, widgetActions)}
     <div class="dashboard-widgets">${widgets || '<div class="empty-state">Add a widget to personalize your overview.</div>'}</div>
     ${hiddenWidgets}
     ${fdicDisclosure()}`;
@@ -455,9 +572,9 @@ function renderDashboardWidget(id) {
   const title = Object.fromEntries(dashboardWidgetCatalog)[id];
   const widgetTools = action => `<span class="widget-tools">${action || ''}${dashboardWidgetDragHandle(id)}${dashboardWidgetHideButton(id)}</span>`;
   const heading = action => `<div class="widget-heading"><h2>${title}</h2>${widgetTools(action)}</div>`;
-  if (id === 'balance') return `<section class="dashboard-widget balance-widget" data-widget="balance"><div class="widget-heading"><p class="eyebrow">Total available</p>${widgetTools('')}</div><strong class="dashboard-total">${formatMoney(totalBalance())}</strong><p class="dashboard-caption">Across ${activeVaults().length} active vaults</p></section>`;
-  if (id === 'vaults') return `<section class="dashboard-widget" data-widget="vaults">${heading(`<button class="text-button" data-page="vaults" type="button">All accounts</button>`)}<div class="bank-list">${vaultAccountRows(activeVaults().slice(0, 4)) || '<div class="empty-state"><strong>No active vaults</strong>Create a vault to start saving.</div>'}</div></section>`;
-  if (id === 'activity') return `<section class="dashboard-widget" data-widget="activity">${heading(`<button class="text-button" data-page="activity" type="button">All activity</button>`)}${transactionTable(state.transactions, 5)}</section>`;
+  if (id === 'balance') return `<section class="dashboard-widget balance-widget" data-widget="balance"><div class="balance-widget-tools">${state.customizingWidgets ? widgetTools('') : ''}</div><div class="balance-widget-layout"><div><strong class="dashboard-total">${formatMoney(totalBalance())}</strong><p class="dashboard-caption">Available across ${activeVaults().length} vaults</p></div><div class="overview-balance-actions"><button class="button secondary" data-action="transfer" type="button">${icon('swap')} Transfer</button><button class="button" data-action="new-vault" type="button">${icon('plus')} New vault</button></div></div>${activitySparkline(state.transactions)}</section>`;
+  if (id === 'vaults') return `<section class="dashboard-widget" data-widget="vaults">${heading(`<button class="text-button" data-page="vaults" type="button">View all ${icon('arrow')}</button>`)}<div class="bank-list">${vaultAccountRows(activeVaults().slice(0, 4)) || '<div class="empty-state"><strong>No active vaults</strong>Create a vault to start saving.</div>'}</div></section>`;
+  if (id === 'activity') return `<section class="dashboard-widget" data-widget="activity">${heading(`<button class="text-button" data-page="activity" type="button">View all ${icon('arrow')}</button>`)}${dashboardActivityRows(state.transactions, 5)}</section>`;
   if (id === 'accounts') return `<section class="dashboard-widget" data-widget="accounts">${heading(`<button class="text-button" data-page="accounts" type="button">Manage</button>`)}${linkedAccountRows(state.linkedAccounts.slice(0, 4))}</section>`;
   if (id === 'goals') {
     const goals = activeVaults().filter(vault => Number(vault.slotGoal?.amount) > 0);
@@ -469,7 +586,7 @@ function renderDashboardWidget(id) {
     }).join('');
     return `<section class="dashboard-widget" data-widget="goals">${heading(`<button class="text-button" data-page="vaults" type="button">View vaults</button>`)}${rows || '<div class="empty-state">Vaults with savings goals will appear here.</div>'}</section>`;
   }
-  if (id === 'rate') return `<section class="dashboard-widget rate-widget" data-widget="rate">${heading('')}<div class="rate-row"><span>Standard deposit rate</span><strong>${formatRate(state.interestRate)}</strong></div></section>`;
+  if (id === 'rate') return `<section class="dashboard-widget rate-widget" data-widget="rate">${heading('')}<div class="rate-highlight"><div><span>Annual percentage yield (APY)</span><strong>${formatRate(state.interestRate, 'apy')}</strong></div><div class="rate-standard"><span>Standard deposit rate</span><strong>${formatRate(state.interestRate)}</strong></div></div></section>`;
   if (id === 'shortcuts') return `<section class="dashboard-widget" data-widget="shortcuts">${heading('')}<div class="quick-actions"><button class="button secondary" data-action="transfer" type="button">${icon('swap')} Transfer</button><button class="button secondary" data-action="new-vault" type="button">${icon('plus')} New vault</button><button class="button secondary" data-action="link-account" type="button">${icon('link')} Link account</button></div></section>`;
   return '';
 }
@@ -587,7 +704,7 @@ function bindDashboardWidgetDragging() {
 function renderVaults() {
   const vaults = activeVaults();
   const rows = vaultAccountRows(vaults);
-  const content = `${pageHeading('Accounts', 'My vaults', 'Available balances by account.', `<button class="button" data-action="new-vault" type="button">${icon('plus')} New vault</button>`)}<section class="bank-list account-list"><div class="bank-list-header"><span>Account</span><span>Available balance</span></div>${rows || '<div class="empty-state"><strong>No active vaults</strong>Create a vault to begin organizing your savings.</div>'}</section>`;
+  const content = `${pageHeading('', 'Vaults', '', `<button class="button" data-action="new-vault" type="button">${icon('plus')} New vault</button>`)}<section class="bank-list account-list"><div class="bank-list-header"><span>Account</span><span>Available balance</span></div>${rows || '<div class="empty-state"><strong>No active vaults</strong>Create a vault to begin organizing your savings.</div>'}</section>`;
   renderShell(content);
   bindPageActions();
 }
@@ -621,7 +738,7 @@ function renderVaultDetail() {
   const slotType = String(vault.slotTypeGuid || '').toUpperCase();
   const canEdit = [slotTypeGuids.saving, slotTypeGuids.expenses].includes(slotType);
   const filters = ['All', 'Active', 'Inactive'].map(filter => `<button class="vault-key-filter ${state.vaultKeyFilter === filter ? 'selected' : ''}" type="button" data-vault-key-filter="${filter}" aria-pressed="${state.vaultKeyFilter === filter}">${filter}</button>`).join('');
-  const content = `${pageHeading('Vault account', safe(vaultName(vault)), `${safe(vaultType(vault))} · Opened ${dateLabel(vault.createdDate)}`, `<div class="heading-actions"><button class="text-button" data-page="vaults" type="button">${icon('arrow')} All vaults</button>${canEdit ? `<button class="button secondary" data-action="edit-vault" type="button">Edit vault</button>` : ''}${slotType === slotTypeGuids.emergency ? `<button class="button secondary" data-emergency-setup="${safe(vaultId(vault))}" type="button">${vault.slotGoal == null ? 'Finish setup' : 'Edit goal'}</button>` : ''}</div>`)}<section class="vault-detail-summary"><div><span>Account type</span><strong>${safe(vaultType(vault))}</strong></div><div><span>Available balance</span><strong>${formatMoney(vaultAmount(vault))}</strong></div>${vault.slotGoal?.amount ? `<div><span>Savings goal</span><strong>${formatMoney(vault.slotGoal.amount)}</strong></div>` : ''}</section><section class="bank-section"><div class="widget-heading"><h2>Recent activity</h2><span class="heading-sub">${detail?.transactions?.length || 0} transactions</span></div>${state.vaultDetailLoading ? '<div class="empty-state">Loading activity…</div>' : transactionTable(detail?.transactions || [], 100)}</section><section class="bank-section"><div class="widget-heading"><div><h2>Vault keys</h2><p class="heading-sub">Account numbers connected to this vault</p></div><div class="vault-key-filters" role="group" aria-label="Filter vault keys">${filters}</div></div><div class="vault-key-list${state.vaultDetailLoading ? ' is-loading' : ''}" id="vault-key-list">${vaultKeyListMarkup(detail, state.vaultKeyFilter, state.vaultDetailLoading)}</div></section>`;
+  const content = `${pageHeading('', safe(vaultName(vault)), `${safe(vaultName(vault))} · Opened ${dateLabel(vault.createdDate)}`, `<div class="heading-actions">${canEdit ? `<button class="button secondary" data-action="edit-vault" type="button">Edit vault</button>` : ''}${slotType === slotTypeGuids.emergency ? `<button class="button secondary" data-emergency-setup="${safe(vaultId(vault))}" type="button">${vault.slotGoal == null ? 'Finish setup' : 'Edit goal'}</button>` : ''}</div>`)}<section class="vault-balance"><div><span>Available balance</span><strong>${formatMoney(vaultAmount(vault))}</strong></div><button class="button secondary" data-action="transfer" type="button">${icon('swap')} Transfer</button></section>${vault.slotGoal?.amount ? `<section class="vault-goal-summary"><span>Savings goal</span><strong>${formatMoney(vault.slotGoal.amount)}</strong></section>` : ''}<section class="bank-section"><div class="widget-heading"><h2>Recent activity</h2><button class="text-button" data-page="activity" type="button">View all ${icon('arrow')}</button></div>${state.vaultDetailLoading ? '<div class="empty-state">Loading activity…</div>' : transactionTable(detail?.transactions || [], 100, { vaultScoped: true })}</section><section class="bank-section"><div class="widget-heading"><div><h2>Vault access</h2><p class="heading-sub">Accounts connected to this vault</p></div><div class="vault-key-filters" role="group" aria-label="Filter vault access">${filters}</div></div><div class="vault-key-list${state.vaultDetailLoading ? ' is-loading' : ''}" id="vault-key-list">${vaultKeyListMarkup(detail, state.vaultKeyFilter, state.vaultDetailLoading)}</div></section>`;
   renderShell(content);
   bindPageActions();
   document.querySelectorAll('[data-vault-key-filter]').forEach(button => button.addEventListener('click', () => {
@@ -674,9 +791,25 @@ async function openVaultDetail(vault, addHistory = true) {
 }
 
 function renderActivity() {
-  const content = `${pageHeading('Your money, moving', 'Activity', 'A running view of transactions across your vaults.', `<button class="button secondary" id="activity-refresh" type="button">${icon('refresh')} Refresh</button>`)}<section class="table-panel"><div class="panel-heading"><h2>All transactions</h2><span class="heading-sub">${state.transactions.length} results</span></div>${state.loading ? '<div class="empty-state">Loading transactions…</div>' : transactionTable(state.transactions, 100)}</section>`;
+  const content = `${pageHeading('Your money, moving', 'Activity', 'A running view of transactions across your vaults.', `<button class="button secondary" id="activity-refresh" type="button">${icon('refresh')} Refresh</button>`)}<section class="table-panel"><div class="panel-heading"><h2>All transactions</h2><span class="heading-sub activity-result-count">${state.transactions.length} results</span></div>${activityResultsMarkup()}</section>`;
   renderShell(content);
   document.querySelector('#activity-refresh').addEventListener('click', loadTransactions);
+}
+
+function activityResultsMarkup(animate = false) {
+  const results = state.loading ? '<div class="empty-state">Loading transactions…</div>' : transactionTable(state.transactions, 100);
+  return `<div class="activity-results${animate ? ' activity-results-enter' : ''}">${results}</div>`;
+}
+
+function updateActivityResults(animate = false) {
+  const currentResults = document.querySelector('.activity-results');
+  if (!currentResults) return false;
+  currentResults.outerHTML = activityResultsMarkup(animate);
+  const results = document.querySelector('.activity-results');
+  bindTransactionMetadata(results);
+  const resultCount = document.querySelector('.activity-result-count');
+  if (resultCount) resultCount.textContent = `${state.transactions.length} results`;
+  return true;
 }
 
 function renderAccounts() {
@@ -700,24 +833,36 @@ function moreRows(value) {
   return listFrom(unwrap(value));
 }
 
-function loadMoreWorkspace() {
-  state.page = 'more';
+function loadMoreData({ refresh = false } = {}) {
+  if (state.moreLoadPromise) return state.moreLoadPromise;
+  if (state.moreLoaded && !refresh) return Promise.resolve();
   state.moreLoading = true;
-  state.moreData = {};
-  render();
+  state.moreLoaded = false;
+  if (refresh) state.moreData = {};
   const requests = {
-    profile: '/api/data/profile', balance: '/api/data/account/balance', defaultVault: '/api/data/account/default-vault',
+    profile: '/api/data/profile',
     cards: '/api/data/cards', statements: '/api/data/documents/statements', taxes: '/api/data/documents/taxes',
     lastInterest: '/api/data/interest/last', messages: '/api/data/messages', agreements: '/api/data/agreements', sharing: '/api/data/sharing',
     notificationPreferences: '/api/data/notification-preferences'
   };
-  return Promise.all(Object.entries(requests).map(async ([key, path]) => {
+  const promise = Promise.all(Object.entries(requests).map(async ([key, path]) => {
     try { state.moreData[key] = await api(path); }
     catch (error) { state.moreData[`${key}Error`] = error.message; }
   })).finally(() => {
     state.moreLoading = false;
+    state.moreLoaded = true;
+    state.moreLoadPromise = null;
     if (state.page === 'more') render();
   });
+  state.moreLoadPromise = promise;
+  return promise;
+}
+
+function loadMoreWorkspace({ refresh = true } = {}) {
+  state.page = 'more';
+  const loading = loadMoreData({ refresh });
+  render();
+  return loading;
 }
 
 function resourceRows(items, titleKeys, detailKeys) {
@@ -760,7 +905,7 @@ function formattedMobile(record) {
 
 function renderMoreContent() {
   const data = state.moreData;
-  if (state.moreLoading && !Object.keys(data).length) return '<div class="empty-state">Loading account tools…</div>';
+  if (state.moreLoading && !state.moreLoaded) return '<div class="empty-state">Loading account tools…</div>';
   if (state.moreTab === 'cards') {
     const cards = moreRows(data.cards?.cards);
     return `<section class="table-panel"><div class="panel-heading"><h2>Debit cards</h2><button class="button secondary" id="request-card" type="button">Request card</button></div>${cards.length ? cards.map(card => {
@@ -787,17 +932,36 @@ function renderMoreContent() {
     return `<section class="table-panel"><div class="panel-heading"><h2>Inbox</h2><div class="heading-actions"><button class="button secondary" id="messages-read-all" type="button">Mark all read</button><button class="icon-button" id="messages-delete-all" type="button" aria-label="Delete all messages" title="Delete all messages">${icon('close')}</button></div></div>${messages.length ? messages.map(message => `<div class="account-line"><span class="quick-icon">${icon('bell')}</span><span class="account-copy"><strong>${safe(valueFrom(message, ['title', 'subject', 'messageTitle']) || 'Elevault message')}</strong><span>${safe(dateLabel(valueFrom(message, ['enteredDateTime', 'createdDate', 'date'])))} · ${safe(valueFrom(message, ['body', 'message', 'description']) || '')}</span></span>${!valueFrom(message, ['read', 'isRead', 'readAt']) ? `<button class="text-button" data-message-read="${safe(valueFrom(message, ['messageGuid', 'id']))}" type="button">Mark read</button>` : '<span class="account-status">Read</span>'}</div>`).join('') : '<div class="empty-state"><strong>No messages</strong>Your Elevault inbox is clear.</div>'}</section>`;
   }
   const profile = unwrap(data.profile) || {};
-  const balance = unwrap(data.balance) || {};
-  const defaultVault = unwrap(data.defaultVault);
-  const defaultId = typeof defaultVault === 'string' ? defaultVault : valueFrom(defaultVault, ['slotGuid', 'defaultSlotGuid', 'id']);
-  const preferredVault = localStorage.getItem('elevault.preferredVault') || defaultId || '';
   const agreements = moreRows(data.agreements);
   const preferences = unwrap(data.notificationPreferences) || {};
   const emailEnabled = valueFrom(preferences, ['emailNotifications']);
   const pushEnabled = valueFrom(preferences, ['pushNotifications']);
   const profileName = [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.alias || 'Profile';
   const profilePhone = formattedMobile(profile) || formattedMobile(unwrap(state.customer) || {});
-  return `<section class="table-panel"><div class="panel-heading"><h2>Account</h2></div><div class="profile-summary"><button class="profile-photo-control" id="profile-photo-trigger" type="button" aria-label="Update profile photo">${profile.imageUrl ? `<img src="${safe(profile.imageUrl)}" alt="">` : `<span class="profile-photo-fallback">${safe(initials(profileName))}</span>`}<span class="profile-photo-edit">${icon('edit')}</span></button><input id="profile-photo" type="file" accept="image/png,image/jpeg,image/webp" hidden><div class="profile-identity"><strong>${safe(profileName)}</strong><span>Elevault account</span></div></div><div class="profile-contact-row"><span>Email</span><strong>${safe(profile.email || 'Not provided')}</strong><button class="text-button" id="change-email" type="button">Edit</button></div><div class="profile-contact-row"><span>Mobile</span><strong>${safe(profilePhone || 'Not provided')}</strong><button class="text-button" id="change-mobile" type="button">Edit</button></div><div class="heading-actions settings-actions"><button class="button secondary" id="change-password" type="button">Change password</button></div><p class="form-error">${safe(data.profileError || '')}</p></section><section class="table-panel more-section"><div class="panel-heading"><h2>Account controls</h2></div><div class="vault-detail-summary"><div><span>Portfolio balance</span><strong>${formatMoney(valueFrom(balance, ['balance', 'portfolioBalance', 'amount']))}</strong></div><div><span>Default vault from Elevault</span><strong>${safe(defaultId ? vaultName(state.vaults.find(vault => vaultId(vault) === defaultId) || { description: defaultId }) : 'Not set')}</strong></div></div><label class="field">Preferred transfer vault in this browser<select id="preferred-vault"><option value="">Use no preference</option>${activeVaults().map(vault => `<option value="${safe(vaultId(vault))}" ${vaultId(vault) === preferredVault ? 'selected' : ''}>${safe(vaultName(vault))}</option>`).join('')}</select></label><form id="limit-check" class="inline-form"><div class="field"><label for="limit-amount">Check transfer amount</label><input id="limit-amount" name="amount" type="number" min="0.01" step="0.01" required></div><button class="button secondary" type="submit">Check limit</button><span id="limit-result" class="heading-sub"></span></form></section><section class="table-panel more-section"><div class="panel-heading"><h2>Notifications</h2></div><label class="toggle-row"><span><strong>Email notifications</strong><small>Account updates by email</small></span><input type="checkbox" data-notification-channel="email" ${emailEnabled === true ? 'checked' : ''} ${emailEnabled === undefined ? 'disabled' : ''}><span class="toggle-control"></span></label><label class="toggle-row"><span><strong>Push notifications</strong><small>Mobile push alerts</small></span><input type="checkbox" data-notification-channel="push" ${pushEnabled === true ? 'checked' : ''} ${pushEnabled === undefined ? 'disabled' : ''}><span class="toggle-control"></span></label><p class="heading-sub">${emailEnabled === undefined ? 'Notification preferences are not included in this account response.' : ''}</p></section><section class="table-panel more-section"><div class="panel-heading"><h2>Agreements</h2></div>${agreements.length ? agreements.map((agreement, index) => `<div class="account-line"><span class="account-copy"><strong>${safe(valueFrom(agreement, ['name', 'title', 'agreementType']) || 'Agreement')}</strong><span>${safe(valueFrom(agreement, ['status', 'acceptedDate', 'version']) || '')}</span></span>${!valueFrom(agreement, ['accepted', 'isAccepted', 'acceptedDate']) ? `<button class="text-button" data-agreement-accept="${index}" type="button">Accept</button>` : ''}</div>`).join('') : '<div class="empty-state">No agreements to review.</div>'}<p class="form-error">${safe(data.agreementsError || '')}</p></section>`;
+  return `
+    <section class="table-panel">
+      <div class="panel-heading"><h2>Account</h2></div>
+      <div class="profile-summary"><button class="profile-photo-control" id="profile-photo-trigger" type="button" aria-label="Update profile photo">${profile.imageUrl ? `<img src="${safe(profile.imageUrl)}" alt="">` : `<span class="profile-photo-fallback">${safe(initials(profileName))}</span>`}<span class="profile-photo-edit">${icon('edit')}</span></button><input id="profile-photo" type="file" accept="image/png,image/jpeg,image/webp" hidden><div class="profile-identity"><strong>${safe(profileName)}</strong><span>Elevault account</span></div></div>
+      <div class="profile-contact-row"><span>Email</span><strong>${safe(profile.email || 'Not provided')}</strong><button class="text-button" id="change-email" type="button">Edit</button></div>
+      <div class="profile-contact-row"><span>Mobile</span><strong>${safe(profilePhone || 'Not provided')}</strong><button class="text-button" id="change-mobile" type="button">Edit</button></div>
+      <div class="heading-actions settings-actions"><button class="button secondary" id="change-password" type="button">Change password</button></div>
+      <p class="form-error">${safe(data.profileError || '')}</p>
+    </section>
+    <section class="table-panel more-section">
+      <div class="panel-heading"><h2>Appearance</h2></div>
+      <label class="toggle-row"><span><strong>Dark mode</strong><small>Use a darker color theme.</small></span><input type="checkbox" data-theme-toggle ${document.documentElement.dataset.theme === 'dark' ? 'checked' : ''}><span class="toggle-control"></span></label>
+    </section>
+    <section class="table-panel more-section">
+      <div class="panel-heading"><h2>Notifications</h2></div>
+      <label class="toggle-row"><span><strong>Email notifications</strong><small>Account updates by email</small></span><input type="checkbox" data-notification-channel="email" ${emailEnabled === true ? 'checked' : ''} ${emailEnabled === undefined ? 'disabled' : ''}><span class="toggle-control"></span></label>
+      <label class="toggle-row"><span><strong>Push notifications</strong><small>Mobile push alerts</small></span><input type="checkbox" data-notification-channel="push" ${pushEnabled === true ? 'checked' : ''} ${pushEnabled === undefined ? 'disabled' : ''}><span class="toggle-control"></span></label>
+      <p class="heading-sub">${emailEnabled === undefined ? 'Notification preferences are not included in this account response.' : ''}</p>
+    </section>
+    <section class="table-panel more-section">
+      <div class="panel-heading"><h2>Agreements</h2></div>
+      ${agreements.length ? agreements.map((agreement, index) => `<div class="account-line"><span class="account-copy"><strong>${safe(valueFrom(agreement, ['name', 'title', 'agreementType']) || 'Agreement')}</strong><span>${safe(valueFrom(agreement, ['status', 'acceptedDate', 'version']) || '')}</span></span>${!valueFrom(agreement, ['accepted', 'isAccepted', 'acceptedDate']) ? `<button class="text-button" data-agreement-accept="${index}" type="button">Accept</button>` : ''}</div>`).join('') : '<div class="empty-state">No agreements to review.</div>'}
+      <p class="form-error">${safe(data.agreementsError || '')}</p>
+    </section>`;
 }
 
 function renderMore() {
@@ -1047,19 +1211,7 @@ function bindMoreActions() {
   document.querySelector('#change-email')?.addEventListener('click', () => showVerifiedContactUpdate('email'));
   document.querySelector('#change-mobile')?.addEventListener('click', () => showVerifiedContactUpdate('mobile'));
   document.querySelector('#change-password')?.addEventListener('click', showPasswordReset);
-  document.querySelector('#preferred-vault')?.addEventListener('change', event => {
-    try { localStorage.setItem('elevault.preferredVault', event.target.value); } catch {}
-    showToast('Browser transfer preference saved.');
-  });
-  document.querySelector('#limit-check')?.addEventListener('submit', async event => {
-    event.preventDefault();
-    const amount = Number(new FormData(event.currentTarget).get('amount'));
-    const result = document.querySelector('#limit-result');
-    try {
-      const data = unwrap(await api(`/api/data/account/limit?amount=${encodeURIComponent(amount)}`));
-      result.textContent = valueFrom(data, ['message', 'status', 'limit', 'approved']) ?? JSON.stringify(data);
-    } catch (error) { result.textContent = error.message; }
-  });
+  document.querySelector('[data-theme-toggle]')?.addEventListener('change', event => applyTheme(event.currentTarget.checked ? 'dark' : 'light'));
   document.querySelectorAll('[data-notification-channel]').forEach(input => input.addEventListener('change', async () => {
     const previous = !input.checked;
     input.disabled = true;
@@ -1104,13 +1256,13 @@ function bindPageActions() {
   document.querySelectorAll('[data-page]:not(.nav-item)').forEach(button => button.addEventListener('click', () => {
     navigatePage(button.dataset.page);
   }));
-  document.querySelector('[data-action="new-vault"]')?.addEventListener('click', showCreateVault);
-  document.querySelector('[data-action="transfer"]')?.addEventListener('click', () => showTransfer());
-  document.querySelector('[data-action="link-account"]')?.addEventListener('click', showLinkAccountOptions);
-  document.querySelector('[data-action="edit-vault"]')?.addEventListener('click', () => {
+  document.querySelectorAll('[data-action="new-vault"]').forEach(button => button.addEventListener('click', () => showCreateVault()));
+  document.querySelectorAll('[data-action="transfer"]').forEach(button => button.addEventListener('click', () => showTransfer()));
+  document.querySelectorAll('[data-action="link-account"]').forEach(button => button.addEventListener('click', showLinkAccountOptions));
+  document.querySelectorAll('[data-action="edit-vault"]').forEach(button => button.addEventListener('click', () => {
     const vault = state.vaults.find(item => vaultId(item) === state.selectedVaultId);
     if (vault) showEditVault(vault);
-  });
+  }));
   document.querySelectorAll('[data-emergency-setup]').forEach(button => button.addEventListener('click', () => {
     const selected = emergencyVault();
     if (!selected) return;
@@ -1194,7 +1346,7 @@ async function applyLocationRoute() {
     if (wasMore && document.querySelector('.more-content')) showMoreTab(route.tab, { addHistory: false, animate: false });
     else {
       state.moreTab = route.tab;
-      await loadMoreWorkspace();
+      await loadMoreWorkspace({ refresh: false });
     }
     return;
   }
@@ -1230,14 +1382,16 @@ function showEditVault(vault) {
 
 async function loadTransactions() {
   state.loading = true;
-  render();
+  if (state.page !== 'activity' || !updateActivityResults()) render();
   try {
     state.transactions = visibleTransactions(listFrom(await api('/api/data/transactions')));
   } catch (error) {
     showToast(error.message, true);
   } finally {
     state.loading = false;
-    render();
+    if (state.page === 'activity') {
+      if (!updateActivityResults(true)) render();
+    }
   }
 }
 
@@ -1363,10 +1517,25 @@ function showDepositVerification(accountId) {
 
 function showVaultKeyDetails(key) {
   const active = Boolean(key.active);
-  modal.innerHTML = `<div class="modal-content"><div class="modal-head"><h2>${safe(key.name || 'Vault key')}</h2><button class="icon-button" id="modal-close" type="button" aria-label="Close">${icon('close')}</button></div><p class="modal-copy">Account details for this vault key.</p><dl class="vault-key-details"><div><dt>Account number</dt><dd>${safe(key.legacyNumber || 'Unavailable')}</dd></div><div><dt>Vault</dt><dd>${safe(key.slotName || 'Vault')}</dd></div><div><dt>Status</dt><dd>${active ? 'Active' : 'Inactive'}</dd></div></dl><p class="form-error" id="vault-key-error" role="alert"></p><div class="modal-actions"><button class="button secondary" id="modal-cancel" type="button">Close</button><button class="button secondary" id="vault-key-toggle" type="button">${active ? 'Deactivate key' : 'Reactivate key'}</button></div></div>`;
+  const accountNumber = String(key.legacyNumber || '');
+  modal.innerHTML = `<div class="modal-content"><div class="modal-head"><h2>${safe(key.name || 'Vault key')}</h2><button class="icon-button" id="modal-close" type="button" aria-label="Close">${icon('close')}</button></div><p class="modal-copy">Account details for this vault key.</p><dl class="vault-key-details"><div class="vault-key-detail"><dt>Routing number</dt><dd><span class="vault-key-value">082908751</span><button class="icon-button vault-key-copy" type="button" data-vault-key-copy="082908751" data-vault-key-copy-label="routing number" aria-label="Copy routing number" title="Copy routing number">${icon('copy')}</button></dd></div><div class="vault-key-detail"><dt>Account number</dt><dd><span class="vault-key-value">${safe(accountNumber || 'Unavailable')}</span><button class="icon-button vault-key-copy" type="button" data-vault-key-copy="${safe(accountNumber)}" data-vault-key-copy-label="account number" aria-label="Copy account number" title="Copy account number" ${accountNumber ? '' : 'disabled'}>${icon('copy')}</button></dd></div><div><dt>Vault</dt><dd>${safe(key.slotName || 'Vault')}</dd></div><div><dt>Status</dt><dd>${active ? 'Active' : 'Inactive'}</dd></div></dl><p class="form-error" id="vault-key-error" role="alert"></p><div class="modal-actions"><button class="button secondary" id="modal-cancel" type="button">Close</button><button class="button secondary" id="vault-key-toggle" type="button">${active ? 'Deactivate key' : 'Reactivate key'}</button></div></div>`;
   modal.showModal();
   modal.querySelector('#modal-close').addEventListener('click', () => modal.close());
   modal.querySelector('#modal-cancel').addEventListener('click', () => modal.close());
+  modal.querySelectorAll('[data-vault-key-copy]').forEach(button => button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(button.dataset.vaultKeyCopy);
+      clearTimeout(button.copyFeedbackTimer);
+      button.innerHTML = icon('check');
+      button.setAttribute('aria-label', `Copied ${button.dataset.vaultKeyCopyLabel}`);
+      button.setAttribute('title', `Copied ${button.dataset.vaultKeyCopyLabel}`);
+      button.copyFeedbackTimer = setTimeout(() => {
+        button.innerHTML = icon('copy');
+        button.setAttribute('aria-label', `Copy ${button.dataset.vaultKeyCopyLabel}`);
+        button.setAttribute('title', `Copy ${button.dataset.vaultKeyCopyLabel}`);
+      }, 2000);
+    } catch {}
+  }));
   modal.querySelector('#vault-key-toggle').addEventListener('click', () => setVaultKeyActive(key, !active));
 }
 
@@ -1631,8 +1800,10 @@ async function start() {
     const health = await api('/api/health');
     state.configured = health.configured;
     state.authenticated = health.authenticated;
+    state.siteVersion = health.version || '';
     if (state.authenticated) {
       await loadDashboard();
+      loadMoreData();
       await applyLocationRoute();
       return;
     }
