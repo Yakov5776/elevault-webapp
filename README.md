@@ -14,3 +14,11 @@ It supports the native app’s email/password login which supports SMS 2fa sign-
 npm install
 npm run dev
 ```
+
+To run with a fictional local account and no Elevault backend requests:
+
+```sh
+DEMO_MODE=true npm run dev
+```
+
+Demo mode starts directly in the sample account. Changes made in demo mode are kept in memory and reset when the server restarts. Leave `DEMO_MODE` unset or set it to `false` to use the production services.

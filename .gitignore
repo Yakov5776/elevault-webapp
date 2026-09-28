@@ -143,3 +143,4 @@ vite.config.ts.timestamp-*
 .vite/
 
 Elevault_v2.38.0(23800002).apks
+*.har

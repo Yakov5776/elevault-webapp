@@ -14,6 +14,8 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const apiBaseUrl = (process.env.ELEVAULT_API_BASE_URL || 'https://api.elevault.digitalfirstsb.io').replace(/\/$/, '');
 const apiKey = process.env.ELEVAULT_API_KEY || '65399136-e9cc-40f9-a631-764a42b4086e';
+const demoMode = process.env.DEMO_MODE === 'true';
+const demoApi = demoMode ? require('./demo-responses') : null;
 const brandGuid = '89FD4A1A-6E1E-4533-BCC3-571F80F2A0F4';
 const spendingSlotTypeGuid = 'FE446A6F-ECCD-4F56-9088-9F4111353BE9';
 const savingsSlotTypeGuid = 'DB5ADD65-4B17-40E5-996F-0D0E0471312C';
@@ -305,6 +307,8 @@ function notificationSummaries(value) {
     read: Boolean(item.read || item.isRead || item.readAt)
   }));
 }
+
+if (demoApi) app.use('/api', demoApi);
 
 app.get('/api/health', (req, res) => {
   res.json({ configured: Boolean(apiKey), authenticated: Boolean(req.session.tokens?.accessToken), version });
