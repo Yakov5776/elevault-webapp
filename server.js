@@ -7,6 +7,7 @@ const path = require('node:path');
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
+const multer = require('multer');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -18,6 +19,11 @@ const savingsSlotTypeGuid = 'DB5ADD65-4B17-40E5-996F-0D0E0471312C';
 const expensesSlotTypeGuid = 'DC446A6F-ECCD-4F56-9088-9F4111353BF6';
 const sessionDirectory = path.join(os.homedir(), '.local', 'share', 'elevault-web');
 const emergencySlotTypeGuid = 'D059A31A-D58C-44EE-837E-809C9536F352';
+const profileImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, callback) => callback(null, ['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype))
+});
 
 fs.mkdirSync(sessionDirectory, { recursive: true, mode: 0o700 });
 fs.chmodSync(sessionDirectory, 0o700);
@@ -124,13 +130,16 @@ async function rawBackend(endpoint, options = {}) {
       : 'Elevault rejected the request.';
     throw new BackendError(response.status, String(message).slice(0, 240), 'UPSTREAM_ERROR');
   }
+  if (options.returnResponse) return { status: response.status, data };
   return data;
 }
 
 async function backendFetch(req, endpoint, options = {}, allowRefresh = true) {
   if (!apiKey) throw new BackendError(503, 'The server is missing ELEVAULT_API_KEY.', 'API_CONFIGURATION_MISSING');
+  const multipart = typeof FormData !== 'undefined' && options.body instanceof FormData;
+  const rawBody = options.rawBody === true;
   const headers = {
-    'content-type': 'application/json',
+    ...(multipart ? {} : { 'content-type': 'application/json' }),
     'x-api-key': apiKey,
     ...(options.headers || {})
   };
@@ -141,7 +150,7 @@ async function backendFetch(req, endpoint, options = {}, allowRefresh = true) {
     response = await fetch(`${apiBaseUrl}${endpoint}`, {
       method: options.method || 'GET',
       headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: options.body === undefined ? undefined : multipart || rawBody ? options.body : JSON.stringify(options.body),
       signal: AbortSignal.timeout(20000)
     });
   } catch (error) {
@@ -185,6 +194,14 @@ function validGuid(value) {
   return typeof value === 'string' && /^[a-zA-Z0-9-]{1,100}$/.test(value);
 }
 
+async function customerIndividual(req) {
+  const response = unwrapBackendData(await backendFetch(req, '/customers?calculateSlotBalances=true')) || {};
+  const customer = (Array.isArray(response) ? response.find(item => item.customerGuid === req.session.customerGuid) : response.individual) || response;
+  const individualGuid = customer.individualId || customer.individualGuid;
+  if (!validGuid(individualGuid)) throw new BackendError(409, 'Elevault did not provide the individual identifier required for this action.', 'INDIVIDUAL_ID_MISSING');
+  return { ...customer, individualGuid };
+}
+
 function ensureSameOrigin(req, res, next) {
   const origin = req.get('origin');
   if (origin && new URL(origin).host !== req.get('host')) {
@@ -196,10 +213,36 @@ function ensureSameOrigin(req, res, next) {
 function listFrom(value) {
   if (Array.isArray(value)) return value;
   if (!value || typeof value !== 'object') return [];
-  for (const key of ['items', 'data', 'results', 'value', 'slots', 'transactions', 'customerLinkAccountACHList', 'individualAlertList']) {
+  for (const key of ['items', 'data', 'results', 'value', 'slots', 'legacySlotNumberList', 'transactions', 'customerLinkAccountACHList', 'individualAlertList', 'memos']) {
     if (Array.isArray(value[key])) return value[key];
   }
   return [];
+}
+
+function mergeSlotMemos(transactions, memos) {
+  const merged = transactions.map(transaction => ({ ...transaction }));
+  for (const memo of memos) {
+    const match = memo?.transactionGuid && merged.find(transaction => String(transaction.transactionGuid || '').toLowerCase() === String(memo.transactionGuid).toLowerCase());
+    if (match) {
+      match.memo = memo;
+      continue;
+    }
+    const amount = Number(memo?.amountDecimal) || 0;
+    merged.push({
+      transactionGuid: memo?.transactionGuid || '',
+      slotGuid: memo?.slotGuid || '',
+      transactionDateTime: memo?.enteredTimestamp || '',
+      shortSmartLabel: memo?.note || '',
+      longSmartLabel: memo?.note || '',
+      transactionAmountDecimal: amount,
+      transactionAmount: amount,
+      transactionAmountABSFormatted: `$${Math.abs(amount).toFixed(2)}`,
+      transactionType: 'Pending',
+      includeInBalance: true,
+      memo
+    });
+  }
+  return merged.sort((a, b) => new Date(b.transactionDateTime) - new Date(a.transactionDateTime));
 }
 
 function unwrapBackendData(value) {
@@ -217,6 +260,8 @@ function customerSummary(value) {
     firstName: customer.firstName || '',
     lastName: customer.lastName || '',
     email: customer.email || '',
+    mobilePhone: customer.individual?.mobilePhone || customer.mobilePhone || '',
+    mobilePhoneFormatted: customer.individual?.mobilePhoneFormatted || customer.mobilePhoneFormatted || '',
     imageUrl: typeof customer.imageUrl === 'string' ? customer.imageUrl : ''
   };
 }
@@ -232,6 +277,17 @@ function linkedAccountSummary(account) {
     status: account.status || 'Connected',
     last4: bankAccountNumber.slice(-4),
     failedAttempts: Number(account.failedAttemps || account.failedAttempts || 0)
+  };
+}
+
+function vaultKeySummary(key) {
+  return {
+    legacySlotNumberGuid: key.legacySlotNumberGuid || '',
+    name: key.name || '',
+    active: key.active === true || key.active === 1 || key.active === 'true',
+    legacyNumber: key.legacyNumber == null ? '' : String(key.legacyNumber),
+    slotGuid: key.slotGuid || '',
+    slotName: key.slotName || ''
   };
 }
 
@@ -325,6 +381,99 @@ app.get('/api/data/vaults', requireCustomer, async (req, res, next) => {
   try {
     const guid = encodeURIComponent(req.session.customerGuid);
     res.json(activeSlots(await backendFetch(req, `/customers/${guid}/slots?calculateSlotBalances=true`)));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/vaults/:slotGuid/detail', requireCustomer, async (req, res, next) => {
+  const { slotGuid } = req.params;
+  if (!validGuid(slotGuid)) return res.status(400).json({ error: 'Invalid vault identifier.' });
+
+  try {
+    const customerGuid = encodeURIComponent(req.session.customerGuid);
+    const slots = activeSlots(await backendFetch(req, `/customers/${customerGuid}/slots?calculateSlotBalances=true`));
+    const vault = slots.find(slot => String(slot.slotGuid || '').toLowerCase() === slotGuid.toLowerCase());
+    if (!vault) return res.status(404).json({ error: 'Vault not found.' });
+
+    const [transactions, keyResponse, memos] = await Promise.all([
+      backendFetch(req, `/slots/${encodeURIComponent(vault.slotGuid)}/transactions?filter=slotGuid[eq]'${encodeURIComponent(vault.slotGuid)}'[and]includeInBalance[eq]1&orderBy=TransactionDateTime%20DESC`),
+      backendFetch(req, `/customers/${customerGuid}/legacySlotNumbers`),
+      backendFetch(req, `/slots/${encodeURIComponent(vault.slotGuid)}/memos`).catch(() => [])
+    ]);
+    const vaultKeys = listFrom(unwrapBackendData(keyResponse))
+      .filter(key => String(key.slotGuid || '').toLowerCase() === String(vault.slotGuid).toLowerCase())
+      .map(vaultKeySummary);
+    res.json({
+      vault: {
+        slotGuid: vault.slotGuid,
+        description: vault.description || '',
+        slotTypeGuid: vault.slotTypeGuid || '',
+        slotAvailableBalance: vault.slotAvailableBalance ?? vault.availableBalance ?? null,
+        slotGoal: vault.slotGoal ?? null,
+        createdDate: vault.createdDate || ''
+      },
+      transactions: mergeSlotMemos(listFrom(unwrapBackendData(transactions)), listFrom(unwrapBackendData(memos))),
+      vaultKeys
+    });
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/vaults/:slotGuid', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const { slotGuid } = req.params;
+  const { name, goal, dueDate } = req.body || {};
+  const goalAmount = Number(goal);
+  const targetDate = typeof dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dueDate)
+    ? new Date(`${dueDate}T00:00:00.000Z`)
+    : null;
+  if (!validGuid(slotGuid) || typeof name !== 'string' || !name.trim() || name.trim().length > 80 ||
+      !Number.isFinite(goalAmount) || goalAmount <= 0 || goalAmount > 10000000 ||
+      !targetDate || Number.isNaN(targetDate.getTime()) || targetDate.toISOString().slice(0, 10) !== dueDate) {
+    return res.status(400).json({ error: 'Enter a vault name, goal, and valid target date.' });
+  }
+
+  try {
+    const customerGuid = encodeURIComponent(req.session.customerGuid);
+    const slots = activeSlots(await backendFetch(req, `/customers/${customerGuid}/slots?calculateSlotBalances=true`));
+    const vault = slots.find(slot => String(slot.slotGuid || '').toLowerCase() === slotGuid.toLowerCase());
+    if (!vault) return res.status(404).json({ error: 'Vault not found.' });
+    if (![savingsSlotTypeGuid, expensesSlotTypeGuid].includes(String(vault.slotTypeGuid || '').toUpperCase())) {
+      return res.status(400).json({ error: 'This vault type cannot be edited here.' });
+    }
+
+    const updatedVault = {
+      ...vault,
+      description: name.trim(),
+      slotGoal: {
+        ...(vault.slotGoal || {}),
+        name: '',
+        amount: goalAmount,
+        targetDate: targetDate.toISOString()
+      }
+    };
+    await backendFetch(req, `/customers/${customerGuid}/slots`, { method: 'PUT', body: updatedVault });
+    res.json({ updated: true });
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/vault-keys/:keyGuid/active', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const { keyGuid } = req.params;
+  const { active } = req.body || {};
+  if (!validGuid(keyGuid) || typeof active !== 'boolean') {
+    return res.status(400).json({ error: 'Choose a valid vault-key status.' });
+  }
+
+  const customerGuid = encodeURIComponent(req.session.customerGuid);
+  try {
+    const response = await backendFetch(req, `/customers/${customerGuid}/legacySlotNumbers`);
+    const key = listFrom(unwrapBackendData(response)).find(item =>
+      String(item.legacySlotNumberGuid || '').toLowerCase() === keyGuid.toLowerCase()
+    );
+    if (!key) return res.status(404).json({ error: 'Vault key not found.' });
+
+    await backendFetch(req, `/customers/${customerGuid}/legacySlotNumbers`, {
+      method: 'PUT',
+      body: { ...key, active, actionAllowed: 'All' }
+    });
+    res.json({ updated: true, active });
   } catch (error) { next(error); }
 });
 
@@ -587,14 +736,422 @@ app.get('/api/data/transactions', requireCustomer, async (req, res, next) => {
   try {
     const slotGuid = req.query.slotGuid;
     if (slotGuid && !validGuid(slotGuid)) return res.status(400).json({ error: 'Invalid vault identifier.' });
-    if (slotGuid) return res.json(await backendFetch(req, `/slots/${encodeURIComponent(slotGuid)}/transactions`));
+    if (slotGuid) {
+      const [transactions, memos] = await Promise.all([
+        backendFetch(req, `/slots/${encodeURIComponent(slotGuid)}/transactions?filter=slotGuid[eq]'${encodeURIComponent(slotGuid)}'[and]includeInBalance[eq]1&orderBy=TransactionDateTime%20DESC`),
+        backendFetch(req, `/slots/${encodeURIComponent(slotGuid)}/memos`).catch(() => [])
+      ]);
+      return res.json(mergeSlotMemos(listFrom(unwrapBackendData(transactions)), listFrom(unwrapBackendData(memos))));
+    }
     const vaultResponse = await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/slots?calculateSlotBalances=true`);
     const vaults = activeSlots(vaultResponse);
-    const batches = await Promise.all(vaults.slice(0, 12).map(vault => {
+    const batches = await Promise.all(vaults.slice(0, 12).map(async vault => {
       const id = vault.slotGuid || vault.guid || vault.id;
-      return validGuid(id) ? backendFetch(req, `/slots/${encodeURIComponent(id)}/transactions`).then(listFrom) : [];
+      if (!validGuid(id)) return [];
+      const [transactions, memos] = await Promise.all([
+        backendFetch(req, `/slots/${encodeURIComponent(id)}/transactions?filter=slotGuid[eq]'${encodeURIComponent(id)}'[and]includeInBalance[eq]1&orderBy=TransactionDateTime%20DESC`).then(listFrom),
+        backendFetch(req, `/slots/${encodeURIComponent(id)}/memos`).then(listFrom).catch(() => [])
+      ]);
+      return mergeSlotMemos(transactions, memos);
     }));
     res.json(batches.flat());
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/account/balance', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/balance`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/account/default-vault', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/defaultslotguid`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/account/limit', requireCustomer, async (req, res, next) => {
+  const amount = Number(req.query.amount);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 10000000) {
+    return res.status(400).json({ error: 'Enter a valid amount to check.' });
+  }
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/limit?amount=${encodeURIComponent(amount)}`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/cards', requireCustomer, async (req, res, next) => {
+  const customerGuid = encodeURIComponent(req.session.customerGuid);
+  try {
+    const [cards, canCreate, approval] = await Promise.all([
+      backendFetch(req, `/customers/${customerGuid}/cards`),
+      backendFetch(req, `/customers/${customerGuid}/cards/canCreate`).catch(() => null),
+      backendFetch(req, `/customers/${customerGuid}/cards/approval`).catch(() => null)
+    ]);
+    res.json({ cards: listFrom(unwrapBackendData(cards)), canCreate, approval });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/data/cards', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const { slotGuid, physicalCard = false } = req.body || {};
+  if (!validGuid(slotGuid) || typeof physicalCard !== 'boolean') {
+    return res.status(400).json({ error: 'Choose a valid spending vault.' });
+  }
+  try {
+    const customerGuid = encodeURIComponent(req.session.customerGuid);
+    const [slotResponse, customerResponse] = await Promise.all([
+      backendFetch(req, `/customers/${customerGuid}/slots?calculateSlotBalances=true`),
+      backendFetch(req, '/customers?calculateSlotBalances=true')
+    ]);
+    const slots = activeSlots(slotResponse);
+    const customerData = unwrapBackendData(customerResponse) || {};
+    const customer = (Array.isArray(customerData) ? customerData.find(item => item.customerGuid === req.session.customerGuid) : customerData.individual) || customerData;
+    const slot = slots.find(item => String(item.slotGuid || '').toLowerCase() === slotGuid.toLowerCase());
+    if (!slot) {
+      return res.status(404).json({ error: 'Vault not found.' });
+    }
+    if (String(slot.slotTypeGuid || '').toLowerCase() !== spendingSlotTypeGuid.toLowerCase()) return res.status(400).json({ error: 'Cards can only be requested for your spending vault.' });
+    const financialInstitutionGuid = customer.financialInstitutionGuid;
+    const financialInstitutionBrandGuid = customer.financialInstitutionBrandGuid;
+    if (!validGuid(financialInstitutionGuid) || !validGuid(financialInstitutionBrandGuid)) return res.status(409).json({ error: 'Elevault has not provided the card issuer details for this account.' });
+    res.status(201).json(await backendFetch(req, `/customers/${customerGuid}/cards`, {
+      method: 'POST',
+      body: {
+        financialInstitutionGuid,
+        financialInstitutionBrandGuid,
+        slotGuid,
+        physicalCard,
+        customerGuid: req.session.customerGuid
+      }
+    }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/cards/:cardGuid/activate', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  if (!validGuid(req.params.cardGuid)) return res.status(400).json({ error: 'Invalid card identifier.' });
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/cards/${encodeURIComponent(req.params.cardGuid)}/activate`, { method: 'PUT' }));
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/data/cards/:cardGuid/status', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  if (!validGuid(req.params.cardGuid)) return res.status(400).json({ error: 'Invalid card identifier.' });
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/cards/${encodeURIComponent(req.params.cardGuid)}/status`, { method: 'DELETE' }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/cards/:cardGuid/pin', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const pin = typeof req.body === 'string' ? req.body : '';
+  if (!validGuid(req.params.cardGuid) || !/^\d{4}$/.test(pin)) {
+    return res.status(400).json({ error: 'Enter a 4 digit PIN.' });
+  }
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/cards/${encodeURIComponent(req.params.cardGuid)}/pin`, { method: 'PUT', body: pin, rawBody: true }));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/documents/statements', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/documents/statements`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/documents/taxes', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/documents/taxes`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/documents/taxes/:year', requireCustomer, async (req, res, next) => {
+  if (!/^\d{4}$/.test(req.params.year)) return res.status(400).json({ error: 'Invalid tax year.' });
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/documents/taxes/${encodeURIComponent(req.params.year)}`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/documents/taxes/:year/:documentId', requireCustomer, async (req, res, next) => {
+  if (!/^\d{4}$/.test(req.params.year) || !validGuid(req.params.documentId)) return res.status(400).json({ error: 'Invalid tax document.' });
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/documents/taxes/${encodeURIComponent(req.params.year)}/${encodeURIComponent(req.params.documentId)}`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/interest/last', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/interest/last`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/interest', requireCustomer, async (req, res, next) => {
+  const { startDate, endDate } = req.query;
+  const pageNumber = Number(req.query.pageNumber || 1);
+  const validDate = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+  if (!validDate(startDate) || !validDate(endDate) || startDate > endDate || !Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > 1000) {
+    return res.status(400).json({ error: 'Choose a valid date range and page.' });
+  }
+  try {
+    const query = new URLSearchParams({ startDate, endDate, pageNumber: String(pageNumber) });
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/interest?${query}`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/messages', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/messages`));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/messages/read', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/messages`, { method: 'PUT', body: req.body || {} }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/messages/read-all', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/messages/readAll`, { method: 'PUT', body: req.body || {} }));
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/data/messages', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/messages`, { method: 'DELETE' }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/notification-preferences/:channel', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  if (!['email', 'push'].includes(req.params.channel) || typeof req.body?.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'Choose a valid notification preference.' });
+  }
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/notifications/${req.params.channel}`, { method: 'PUT', body: req.body }));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/notification-preferences', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/notifications`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/agreements', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/agreements`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/profile', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(unwrapBackendData(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}`)));
+  } catch (error) { next(error); }
+});
+
+app.post('/api/data/profile/image', ensureSameOrigin, requireCustomer, profileImageUpload.single('file'), async (req, res, next) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a PNG, JPEG, or WebP image up to 5 MB.' });
+  try {
+    const form = new FormData();
+    form.append('file', new Blob([req.file.buffer], { type: req.file.mimetype }), req.file.originalname || 'image');
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/images`, { method: 'POST', body: form }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/profile/email', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) return res.status(400).json({ error: 'Enter a valid email address.' });
+  if (req.session.verifiedContactUpdate?.email !== email.toLowerCase()) return res.status(403).json({ error: 'Verify this email address before updating your profile.' });
+  try {
+    const individual = await customerIndividual(req);
+    const result = await backendFetch(req, `/customers/${encodeURIComponent(individual.individualGuid)}/email`, { method: 'PUT', body: { emailAddress: email } });
+    delete req.session.verifiedContactUpdate.email;
+    res.json(result);
+  } catch (error) { next(error); }
+});
+
+app.post('/api/data/profile/contact-availability', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const channel = req.body?.channel;
+  const value = typeof req.body?.value === 'string' ? req.body.value.trim() : '';
+  if (!['email', 'mobile'].includes(channel) || !value) return res.status(400).json({ error: 'Enter a valid contact value.' });
+  if (channel === 'email' && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) || value.length > 254)) return res.status(400).json({ error: 'Enter a valid email address.' });
+  const mobile = value.replace(/[^\d]/g, '');
+  if (channel === 'mobile' && !/^\d{10,15}$/.test(mobile)) return res.status(400).json({ error: 'Enter a valid phone number.' });
+  try {
+    const query = channel === 'email' ? `email=${encodeURIComponent(value)}` : `mobile=${encodeURIComponent(mobile)}`;
+    const response = await backendFetch(req, `/brands/${brandGuid}/${channel}/?${query}`, { method: 'HEAD', returnResponse: true });
+    if (response.status !== 204) return res.status(409).json({ error: channel === 'email' ? 'That email address is already in use.' : 'That phone number is already in use.' });
+    res.json({ available: true });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/data/profile/contact-code/:channel', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const { channel } = req.params;
+  const value = typeof req.body?.value === 'string' ? req.body.value.trim() : '';
+  if (!['email', 'mobile'].includes(channel) || !value) return res.status(400).json({ error: 'Enter a valid contact value.' });
+  if (channel === 'email' && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) || value.length > 254)) return res.status(400).json({ error: 'Enter a valid email address.' });
+  const mobile = value.replace(/[^\d]/g, '');
+  if (channel === 'mobile' && !/^\d{10,15}$/.test(mobile)) return res.status(400).json({ error: 'Enter a valid phone number.' });
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (req.method === 'PUT' && !code) return res.status(400).json({ error: 'Enter the verification code.' });
+  try {
+    const emailChannel = channel === 'email';
+    const endpoint = `/verifications/${emailChannel ? 'email' : 'sms'}`;
+    const body = emailChannel
+      ? { emailAddress: value, ...(req.method === 'POST' ? { brandGuid } : {}), ...(code ? { code } : {}) }
+      : { to: `+1${mobile}`, ...(code ? { code } : {}) };
+    const result = await backendFetch(req, endpoint, { method: req.method, body });
+    if (req.method === 'PUT' && (result?.verified === true || result?.valid === true)) {
+      req.session.verifiedContactUpdate ||= {};
+      req.session.verifiedContactUpdate[channel] = emailChannel ? value.toLowerCase() : mobile;
+    }
+    res.json(result);
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/profile/mobile', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const mobile = typeof req.body?.mobile === 'string' ? req.body.mobile.replace(/[^\d+]/g, '') : '';
+  if (!/^\+?\d{10,15}$/.test(mobile)) return res.status(400).json({ error: 'Enter a valid phone number.' });
+  if (req.session.verifiedContactUpdate?.mobile !== mobile.replace(/\D/g, '')) return res.status(403).json({ error: 'Verify this phone number before updating your profile.' });
+  try {
+    const individual = await customerIndividual(req);
+    const result = await backendFetch(req, `/customers/${encodeURIComponent(individual.individualGuid)}/mobile?mobile=${encodeURIComponent(mobile)}`, { method: 'PUT' });
+    delete req.session.verifiedContactUpdate.mobile;
+    res.json(result);
+  } catch (error) { next(error); }
+});
+
+app.post('/api/data/password/reset-code', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const emailAddress = typeof req.body?.emailAddress === 'string' ? req.body.emailAddress.trim() : '';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress)) return res.status(400).json({ error: 'Enter a valid email address.' });
+  try {
+    res.json(await backendFetch(req, '/verifications/email', { method: 'POST', body: { emailAddress } }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/password/verify-code', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const emailAddress = typeof req.body?.emailAddress === 'string' ? req.body.emailAddress.trim() : '';
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  if (!emailAddress || !code) return res.status(400).json({ error: 'Enter the email and verification code.' });
+  try {
+    res.json(await backendFetch(req, '/verifications/email', { method: 'PUT', body: { emailAddress, code } }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/password', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const { emailAddress, code, password } = req.body || {};
+  if (typeof emailAddress !== 'string' || typeof code !== 'string' || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+    return res.status(400).json({ error: 'Enter your email, verification code, and a password of at least 8 characters.' });
+  }
+  try {
+    res.json(await backendFetch(req, '/accounts/password', { method: 'PUT', body: { emailAddress, code, password } }));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/sharing/relationships/search', requireCustomer, async (req, res, next) => {
+  const email = typeof req.query.email === 'string' ? req.query.email.trim() : '';
+  const mobile = typeof req.query.mobile === 'string' ? req.query.mobile.replace(/[^\d]/g, '') : '';
+  if (Boolean(email) === Boolean(mobile) || (email && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254)) || (mobile && !/^\d{10,15}$/.test(mobile))) {
+    return res.status(400).json({ error: 'Enter one valid email address or mobile number.' });
+  }
+  try {
+    const path = email
+      ? `/customers/snippets/email/?email=${encodeURIComponent(email)}`
+      : `/customers/snippets/mobile/?mobile=${encodeURIComponent(mobile)}`;
+    res.json(await backendFetch(req, path));
+  } catch (error) { next(error); }
+});
+
+app.post('/api/data/sharing/relationships', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  const { toIndividualGuid, toIndividualName, toIndividualImageUrl = '' } = req.body || {};
+  if (!validGuid(toIndividualGuid) || typeof toIndividualName !== 'string' || !toIndividualName.trim() || toIndividualName.length > 120 || typeof toIndividualImageUrl !== 'string' || toIndividualImageUrl.length > 2048) {
+    return res.status(400).json({ error: 'Choose a valid Elevault contact.' });
+  }
+  try {
+    const individual = await customerIndividual(req);
+    const individualGuid = individual.individualGuid;
+    res.status(201).json(await backendFetch(req, `/customers/${encodeURIComponent(individualGuid)}/relationships`, {
+      method: 'POST', body: {
+        toIndividualGuid,
+        toIndividualName: toIndividualName.trim(),
+        toIndividualImageUrl,
+        active: true,
+        individualGuid,
+        relationshipType: 'Friend',
+        toRelationshipType: 'Friend'
+      }
+    }));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/data/sharing/requests/:accept', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  if (!['true', 'false'].includes(req.params.accept) || !req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    return res.status(400).json({ error: 'Invalid vault-share request.' });
+  }
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/slotshares/${req.params.accept}`, {
+      method: 'PUT', body: req.body, headers: { 'content-type': 'application/json-patch+json' }
+    }));
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/data/sharing/relationships/:relationshipGuid', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  if (!validGuid(req.params.relationshipGuid)) return res.status(400).json({ error: 'Invalid relationship identifier.' });
+  try {
+    res.json(await backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/relationships/${encodeURIComponent(req.params.relationshipGuid)}`, { method: 'DELETE' }));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/sharing', requireCustomer, async (req, res, next) => {
+  try {
+    const [sharedWithMe, relationships] = await Promise.all([
+      backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/sharedWithMe`),
+      backendFetch(req, `/customers/${encodeURIComponent(req.session.customerGuid)}/relationshipsnippets`).catch(() => [])
+    ]);
+    res.json({ sharedWithMe, relationships });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/vaults/:slotGuid/shares', requireCustomer, async (req, res, next) => {
+  if (!validGuid(req.params.slotGuid)) return res.status(400).json({ error: 'Invalid vault identifier.' });
+  try {
+    res.json(await backendFetch(req, `/slots/${encodeURIComponent(req.params.slotGuid)}/sharedwith`));
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/data/vaults/:slotGuid/shares/:shareId', ensureSameOrigin, requireCustomer, async (req, res, next) => {
+  if (!validGuid(req.params.slotGuid) || !validGuid(req.params.shareId)) return res.status(400).json({ error: 'Invalid sharing identifier.' });
+  try {
+    res.json(await backendFetch(req, `/slots/${encodeURIComponent(req.params.slotGuid)}/sharedwith/${encodeURIComponent(req.params.shareId)}`, { method: 'DELETE' }));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/transactions/:transactionGuid/metadata', requireCustomer, async (req, res, next) => {
+  if (!validGuid(req.params.transactionGuid)) return res.status(400).json({ error: 'Invalid transaction identifier.' });
+  try {
+    res.json(await backendFetch(req, `/transactions/${encodeURIComponent(req.params.transactionGuid)}/metadata`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/transaction-types', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/brands/${brandGuid}/transactiontypes`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/slot-types', requireCustomer, async (req, res, next) => {
+  try {
+    res.json(await backendFetch(req, `/brands/${brandGuid}/slottypes`));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/data/transaction-hold', requireCustomer, async (req, res, next) => {
+  const { slotGuid, linkAccountId } = req.query;
+  const amount = Number(req.query.amount);
+  if (!validGuid(slotGuid) || !validGuid(linkAccountId) || !Number.isFinite(amount) || amount <= 0 || amount > 10000000) {
+    return res.status(400).json({ error: 'Choose a valid destination, linked account, and amount.' });
+  }
+  try {
+    const query = new URLSearchParams({ customerGuid: req.session.customerGuid, slotGuid, transactionAmount: String(amount), linkAccountId });
+    res.json(await backendFetch(req, `/transactions/hold?${query}`));
   } catch (error) { next(error); }
 });
 
@@ -677,6 +1234,10 @@ app.post('/api/data/transfers', ensureSameOrigin, requireCustomer, async (req, r
 });
 
 app.use(express.static(path.join(__dirname, 'public'), { index: 'index.html' }));
+
+app.get(/^\/(?:dashboard|vaults|activity|accounts|notifications|my(?:\/[^/]+)?|vault\/[^/]+)\/?$/, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
